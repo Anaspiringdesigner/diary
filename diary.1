@@ -1,0 +1,118 @@
+.TH DIARY 1 "2026-11-01" "diary 0.1.0" "User Commands"
+.SH NAME
+diary \- a terminal-first journal that typesets monthly PDFs
+.SH SYNOPSIS
+.B diary
+[\fIOPTIONS\fR] [\fITEXT\fR...]
+.br
+.B diary
+\fIwrite\fR|\fIedit\fR|\fIopen\fR|\fIbuild\fR|\fIlist\fR|\fIhelp\fR [\fIOPTIONS\fR]
+.SH DESCRIPTION
+.B diary
+stores entries as Markdown in a monthly folder and typesets each month into a
+ruled PDF with Tectonic (XeTeX). Entries are grouped by day and stamped with the
+local time at which they were saved.
+.PP
+With no arguments,
+.B diary
+opens your editor for a new entry. Text arguments add a quick entry, and text
+piped on standard input is read from the pipe.
+.SH COMMANDS
+.TP
+.B write
+Write a new entry in your editor.
+.TP
+.B edit
+Edit the current month's
+.I entries.md
+and rebuild the PDF if it changed.
+.TP
+.B open
+Open the current month's PDF, building it first if needed.
+.TP
+.B build
+Rebuild the current month's PDF.
+.TP
+.B list
+List all months, entry counts, last entry dates, and PDF availability.
+.TP
+.B help
+Show the built-in help text.
+.SH OPTIONS
+.TP
+.BI \-\-date " YYYY-MM-DD"
+Add an entry to another day and its month.
+.TP
+.BI \-\-month " YYYY-MM"
+Choose a month for
+.BR edit ,
+.BR open ,
+or
+.BR build .
+.TP
+.B \-\-no\-open
+Do not launch the PDF viewer after building.
+.TP
+.B \-h, \-\-help
+Show the built-in help text.
+.SH ENVIRONMENT
+.TP
+.B DIARY_DIR
+Diary root directory. Default:
+.I ~/Documents/diary
+.TP
+.B DIARY_TEMPLATE
+LaTeX template used for PDF generation. Default: the
+.I template.tex
+installed with the package.
+.TP
+.B DIARY_TECTONIC
+Path to a specific Tectonic executable.
+.TP
+.B DIARY_EDITOR
+Editor command for entries. Falls back to
+.BR VISUAL ,
+then
+.BR EDITOR .
+.TP
+.B DIARY_NO_OPEN
+Set to
+.B 1
+to never launch the PDF viewer.
+.SH FILES
+.TP
+.I ~/Documents/diary/YYYY-MM Month/entries.md
+The source of truth for the month.
+.TP
+.I ~/Documents/diary/YYYY-MM Month/Month YYYY.pdf
+The typeset month.
+.TP
+.I ~/Documents/diary/YYYY-MM Month/.build/
+Generated LaTeX and build log; safe to delete.
+.SH EXAMPLES
+Write a new entry in your editor:
+.PP
+.RS 4
+diary
+.RE
+.PP
+Add a quick entry:
+.PP
+.RS 4
+diary "Rain all afternoon. Read by the window."
+.RE
+.PP
+Add an entry to an older day:
+.PP
+.RS 4
+diary \-\-date 2026-10-20 "A note I forgot to add."
+.RE
+.PP
+Open another month:
+.PP
+.RS 4
+diary open \-\-month 2026-09
+.RE
+.SH SEE ALSO
+.BR tectonic (1),
+.BR xdg-open (1)

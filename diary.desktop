@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Diary
+Comment=A journaling tool with Markdown entries and PDF generation
+Exec=diary
+Icon=utilities-terminal
+Type=Application
+Categories=Utility;
+Terminal=true

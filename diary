@@ -1,0 +1,877 @@
+#!/usr/bin/env python3
+"""
+diary - a small, terminal-first journal that typesets itself.
+
+Entries live in a plain Markdown file for each month. The PDF is generated
+with Tectonic (XeTeX) from template.tex, which draws warm, ruled paper.
+Each new entry is stamped with its local save time, printed in the margin.
+
+    diary                 write an entry in $EDITOR
+    diary "some words"    append a quick entry
+    diary open            open this month's PDF
+    diary --help          see everything else
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HOME = Path.home()
+HERE = Path(__file__).resolve().parent
+
+DEFAULT_ROOT = HOME / "Documents" / "diary"
+DEFAULT_TEMPLATE = HERE / "template.tex"
+
+# Installed packages put the template in /usr/share/diary rather than next to
+# the executable, so fall back to the system path when running from /usr/bin.
+SYSTEM_TEMPLATE = Path("/usr/share/diary/template.tex")
+if not DEFAULT_TEMPLATE.exists() and SYSTEM_TEMPLATE.exists():
+    DEFAULT_TEMPLATE = SYSTEM_TEMPLATE
+
+ROOT = Path(os.environ.get("DIARY_DIR") or DEFAULT_ROOT).expanduser()
+TEMPLATE = Path(os.environ.get("DIARY_TEMPLATE") or DEFAULT_TEMPLATE).expanduser()
+
+MONTHS = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+]
+WEEKDAYS = [
+    "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
+]
+
+SUBCOMMANDS = {"write", "add", "edit", "open", "build", "list", "months", "help"}
+
+NO_OPEN_DEFAULT = os.environ.get("DIARY_NO_OPEN", "").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+
+
+class DiaryError(Exception):
+    """A message meant for the person using the diary."""
+
+
+def private_chmod(path: Path, mode: int) -> None:
+    """Keep the diary private, but do not fail on filesystems without chmod."""
+    try:
+        path.chmod(mode)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Calendar and paths
+# ---------------------------------------------------------------------------
+
+def current_month() -> dt.date:
+    return dt.date.today().replace(day=1)
+
+
+def parse_month(value: str) -> dt.date:
+    try:
+        return dt.datetime.strptime(value, "%Y-%m").date().replace(day=1)
+    except ValueError:
+        raise DiaryError(f"Invalid month {value!r}. Use YYYY-MM, for example 2026-10.")
+
+
+def parse_day(value: str) -> dt.date:
+    try:
+        return dt.date.fromisoformat(value)
+    except ValueError:
+        raise DiaryError(f"Invalid date {value!r}. Use YYYY-MM-DD, for example 2026-10-22.")
+
+
+def month_folder(month: dt.date) -> Path:
+    return ROOT / f"{month.year:04d}-{month.month:02d} {MONTHS[month.month - 1]}"
+
+
+def entries_path(month: dt.date) -> Path:
+    return month_folder(month) / "entries.md"
+
+
+def pdf_path(month: dt.date) -> Path:
+    return month_folder(month) / f"{MONTHS[month.month - 1]} {month.year}.pdf"
+
+
+def pretty(path: Path) -> str:
+    try:
+        return "~/" + str(path.relative_to(HOME))
+    except ValueError:
+        return str(path)
+
+
+def display_date(day: dt.date) -> str:
+    return f"{WEEKDAYS[day.weekday()]}, {day.day} {MONTHS[day.month - 1]} {day.year}"
+
+
+def short_date(day: dt.date) -> str:
+    return f"{day.day} {MONTHS[day.month - 1][:3]} {day.year}"
+
+
+def ensure_entries_file(month: dt.date) -> Path:
+    folder = month_folder(month)
+    root_existed = ROOT.exists()
+    folder_existed = folder.exists()
+
+    folder.mkdir(parents=True, exist_ok=True)
+    if not root_existed:
+        private_chmod(ROOT, 0o700)
+    if not folder_existed:
+        private_chmod(folder, 0o700)
+
+    path = entries_path(month)
+    if not path.exists():
+        path.write_text(f"# {MONTHS[month.month - 1]} {month.year}\n", encoding="utf-8")
+        private_chmod(path, 0o600)
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Reading and appending entries
+# ---------------------------------------------------------------------------
+
+def heading_date(line: str, lineno: int) -> dt.date:
+    raw = line[3:].strip()
+    try:
+        return dt.date.fromisoformat(raw)
+    except ValueError:
+        raise DiaryError(
+            f"Could not read the heading on line {lineno}: {line!r}\n"
+            "Use an ISO date, for example: ## 2026-10-22"
+        )
+
+
+TIME_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
+
+
+def heading_time(line: str, lineno: int) -> str:
+    raw = line[4:].strip()
+    match = TIME_RE.fullmatch(raw)
+    if not match:
+        raise DiaryError(
+            f"Could not read the time on line {lineno}: {line!r}\n"
+            "Use a 24-hour time, for example: ### 09:12"
+        )
+
+    hour, minute = int(match.group(1)), int(match.group(2))
+    if hour > 23 or minute > 59:
+        raise DiaryError(
+            f"Invalid time on line {lineno}: {raw!r}.\n"
+            "Use a 24-hour time between 00:00 and 23:59."
+        )
+    return f"{hour:02d}:{minute:02d}"
+
+
+def read_days(
+    month: dt.date,
+) -> list[tuple[dt.date, list[tuple[str | None, str]]]]:
+    """Return days with their entries as (time, body) pairs.
+
+    A day heading is ``## YYYY-MM-DD``. Each entry may begin with a
+    ``### HH:MM`` subheading. Text directly under the day heading is an
+    untimed entry, so files written before times were added still render.
+    """
+    path = entries_path(month)
+    if not path.exists():
+        return []
+
+    lines = path.read_text(encoding="utf-8").splitlines()
+    days: list[tuple[dt.date, list[tuple[str | None, str]]]] = []
+    current_day: tuple[dt.date, list[tuple[str | None, str]]] | None = None
+    current_time: str | None = None
+    buffer: list[str] = []
+
+    def flush() -> None:
+        nonlocal buffer
+        body = "\n".join(buffer).strip()
+        if current_day is not None and body:
+            current_day[1].append((current_time, body))
+        buffer = []
+
+    for lineno, line in enumerate(lines, 1):
+        if line.startswith("## "):
+            flush()
+            current_day = (heading_date(line, lineno), [])
+            days.append(current_day)
+            current_time = None
+        elif line.startswith("### "):
+            if current_day is None:
+                raise DiaryError(
+                    f"Time heading before any date heading on line {lineno}: {line!r}\n"
+                    "Put a date heading first, for example: ## 2026-10-22"
+                )
+            flush()
+            current_time = heading_time(line, lineno)
+        elif current_day is not None:
+            buffer.append(line)
+    flush()
+
+    return [(day, entries) for day, entries in days if entries]
+
+
+def append_entry(
+    month: dt.date, day: dt.date, entry_time: str, text: str
+) -> Path:
+    """Append a time-stamped entry beneath the day's heading."""
+    text = text.strip()
+    if not text:
+        raise DiaryError("Nothing to add.")
+
+    path = ensure_entries_file(month)
+    lines = path.read_text(encoding="utf-8").splitlines()
+
+    headings: list[tuple[int, dt.date]] = []
+    for i, line in enumerate(lines):
+        if line.startswith("## "):
+            try:
+                headings.append((i, dt.date.fromisoformat(line[3:].strip())))
+            except ValueError:
+                # Leave hand-written or malformed headings alone while appending.
+                continue
+
+    target: int | None = None
+    for i, date in headings:
+        if date == day:
+            target = i
+
+    block = text.splitlines()
+    # The entry format reserves "## " and "### " for headings. If someone
+    # types either at the start of a line, keep it as prose instead of
+    # accidentally creating a malformed section or time.
+    block = [
+        " " + line if line.startswith(("## ", "### ")) else line
+        for line in block
+    ]
+
+    if target is None:
+        section = [
+            f"## {day.isoformat()}",
+            "",
+            f"### {entry_time}",
+            "",
+            *block,
+            "",
+        ]
+        later = [i for i, date in headings if date > day]
+        if later:
+            insert_at = later[0]
+            if insert_at > 0 and lines[insert_at - 1].strip():
+                section = [""] + section
+            lines[insert_at:insert_at] = section
+        else:
+            while lines and not lines[-1].strip():
+                lines.pop()
+            if lines:
+                lines.append("")
+            lines.extend(section)
+    else:
+        end = len(lines)
+        for i in range(target + 1, len(lines)):
+            if lines[i].startswith("## "):
+                end = i
+                break
+
+        insert_at = end
+        while insert_at > target + 1 and not lines[insert_at - 1].strip():
+            insert_at -= 1
+
+        addition = ["", f"### {entry_time}", "", *block]
+        lines[insert_at:insert_at] = addition
+
+        # Keep exactly one blank line between this section and the next heading.
+        end = len(lines)
+        next_heading = None
+        for i in range(target + 1, len(lines)):
+            if lines[i].startswith("## "):
+                end = i
+                next_heading = i
+                break
+        if next_heading is not None:
+            insert_at = end
+            while insert_at > target + 1 and not lines[insert_at - 1].strip():
+                insert_at -= 1
+            lines[insert_at:end] = [""]
+
+    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Turning prose into LaTeX
+# ---------------------------------------------------------------------------
+
+LATEX_ESCAPES = {
+    "\\": r"\textbackslash{}",
+    "{": r"\{",
+    "}": r"\}",
+    "$": r"\$",
+    "&": r"\&",
+    "#": r"\#",
+    "%": r"\%",
+    "_": r"\_",
+    "^": r"\textasciicircum{}",
+    "~": r"\textasciitilde{}",
+    "<": r"\textless{}",
+    ">": r"\textgreater{}",
+}
+
+
+def escape_latex(text: str) -> str:
+    return "".join(LATEX_ESCAPES.get(char, char) for char in text)
+
+
+def smarten(text: str) -> str:
+    """Turn straight quotes, dashes, and ellipses into typographic ones."""
+    text = text.replace("---", "\u2014").replace("--", "\u2013")
+    text = text.replace("...", "\u2026")
+
+    result: list[str] = []
+    for i, char in enumerate(text):
+        previous = text[i - 1] if i else ""
+        following = text[i + 1] if i + 1 < len(text) else ""
+
+        if char == '"':
+            if not previous or previous in " \t\n([{\u2014\u2013":
+                result.append("\u201c")
+            else:
+                result.append("\u201d")
+        elif char == "'":
+            if (not previous or previous in " \t\n([{\u2014\u2013") and (
+                following.isalnum() or following in "\u201c\u2018"
+            ):
+                result.append("\u2018")
+            else:
+                result.append("\u2019")
+        else:
+            result.append(char)
+
+    return "".join(result)
+
+
+def inline_markup(text: str) -> str:
+    text = re.sub(r"\*\*(.+?)\*\*", r"\\textbf{\1}", text, flags=re.S)
+    text = re.sub(
+        r"(?<!\*)\*(?!\*)(\S(?:.*?\S)?)(?<!\*)\*(?!\*)",
+        r"\\emph{\1}",
+        text,
+        flags=re.S,
+    )
+    return text
+
+
+def render_entry_text(text: str) -> str:
+    paragraphs = re.split(r"\n[ \t]*\n", text.strip())
+    rendered: list[str] = []
+
+    for paragraph in paragraphs:
+        flat = " ".join(line.strip() for line in paragraph.splitlines()).strip()
+        if not flat:
+            continue
+        flat = escape_latex(flat)
+        flat = smarten(flat)
+        flat = inline_markup(flat)
+        rendered.append(flat)
+
+    return "\n\n".join(rendered)
+
+
+def render_entries(
+    days: list[tuple[dt.date, list[tuple[str | None, str]]]]
+) -> str:
+    chunks: list[str] = []
+    for day_index, (day, entries) in enumerate(days):
+        if day_index:
+            chunks.append(r"\diarygap")
+        chunks.append(r"\diarydate{" + display_date(day) + "}")
+
+        for entry_index, (entry_time, body) in enumerate(entries):
+            if entry_index:
+                chunks.append(r"\diaryentrygap")
+            rendered = render_entry_text(body)
+            if entry_time:
+                chunks.append(r"\entrytime{" + entry_time + "}" + rendered + r"\par")
+            else:
+                chunks.append(r"\noindent " + rendered + r"\par")
+
+    return "\n\n".join(chunks)
+
+
+# ---------------------------------------------------------------------------
+# Building the PDF
+# ---------------------------------------------------------------------------
+
+def find_tectonic() -> str:
+    override = os.environ.get("DIARY_TECTONIC")
+    if override:
+        return override
+
+    found = shutil.which("tectonic")
+    if found:
+        return found
+
+    local = HOME / ".local" / "bin" / "tectonic"
+    if local.exists():
+        return str(local)
+
+    raise DiaryError(
+        "Tectonic is not installed. Install it with `paru -S tectonic`, or put a "
+        "copy of the tectonic binary in ~/.local/bin."
+    )
+
+
+def compilation_details(process: subprocess.CompletedProcess[str], build_dir: Path) -> str:
+    log = build_dir / "diary.log"
+    lines: list[str] = []
+    for stream in (process.stdout, process.stderr):
+        for line in (stream or "").splitlines():
+            if line.strip() and "Fontconfig warning" not in line:
+                lines.append(line.rstrip())
+
+    tail = "\n".join(lines[-18:])
+    if log.exists():
+        log_lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
+        error_at = None
+        for i, line in enumerate(log_lines):
+            if line.startswith("!"):
+                error_at = i
+        if error_at is not None:
+            tail = "\n".join(log_lines[error_at:error_at + 12])
+
+    detail = f"See {pretty(log)}."
+    if tail:
+        detail += "\n\n" + tail
+    return detail
+
+
+def build(month: dt.date) -> Path:
+    if not TEMPLATE.exists():
+        raise DiaryError(f"Template not found: {pretty(TEMPLATE)}")
+
+    days = read_days(month)
+    if not days:
+        raise DiaryError(
+            f"No entries yet in {pretty(month_folder(month))}. "
+            "Write one with `diary`."
+        )
+
+    body = render_entries(days)
+    latex = (
+        TEMPLATE.read_text(encoding="utf-8")
+        .replace("@@MONTH@@", MONTHS[month.month - 1])
+        .replace("@@YEAR@@", str(month.year))
+        .replace("@@ENTRIES@@", body)
+    )
+
+    folder = month_folder(month)
+    build_dir = folder / ".build"
+    build_dir.mkdir(parents=True, exist_ok=True)
+    private_chmod(build_dir, 0o700)
+    tex_path = build_dir / "diary.tex"
+    tex_path.write_text(latex, encoding="utf-8")
+    private_chmod(tex_path, 0o600)
+
+    tectonic = find_tectonic()
+    command = [
+        tectonic,
+        "--chatter", "minimal",
+        "--keep-logs",
+        "--outdir", str(build_dir),
+        str(tex_path),
+    ]
+
+    try:
+        process = subprocess.run(
+            command,
+            cwd=str(folder),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except FileNotFoundError:
+        raise DiaryError(f"Could not run Tectonic at {tectonic}.")
+
+    if process.returncode != 0:
+        raise DiaryError("The page could not be compiled.\n\n" + compilation_details(process, build_dir))
+
+    produced = build_dir / "diary.pdf"
+    if not produced.exists():
+        raise DiaryError(
+            "Tectonic finished, but no PDF appeared. "
+            f"See {pretty(build_dir / 'diary.log')}."
+        )
+
+    destination = pdf_path(month)
+    temporary = folder / (destination.name + ".tmp")
+    shutil.copyfile(produced, temporary)
+    private_chmod(temporary, 0o600)
+    private_chmod(produced, 0o600)
+    log_path = build_dir / "diary.log"
+    if log_path.exists():
+        private_chmod(log_path, 0o600)
+    os.replace(temporary, destination)
+    return destination
+
+
+def needs_rebuild(month: dt.date) -> bool:
+    pdf = pdf_path(month)
+    if not pdf.exists():
+        return True
+
+    pdf_time = pdf.stat().st_mtime
+    sources = [entries_path(month), TEMPLATE]
+    return any(path.exists() and path.stat().st_mtime > pdf_time for path in sources)
+
+
+# ---------------------------------------------------------------------------
+# Editor and viewer
+# ---------------------------------------------------------------------------
+
+def choose_editor() -> list[str]:
+    for variable in ("DIARY_EDITOR", "VISUAL", "EDITOR"):
+        value = os.environ.get(variable)
+        if value:
+            command = shlex.split(value)
+            if command:
+                return command
+
+    for candidate in ("nvim", "vim", "nano"):
+        if shutil.which(candidate):
+            return [candidate]
+
+    raise DiaryError("No editor found. Set $EDITOR, for example: export EDITOR=nvim")
+
+
+def run_editor(path: Path) -> int:
+    command = choose_editor() + [str(path)]
+    try:
+        return subprocess.run(command, check=False).returncode
+    except FileNotFoundError:
+        raise DiaryError(f"Editor not found: {command[0]}")
+
+
+def compose_entry(day: dt.date) -> str | None:
+    handle, temporary = tempfile.mkstemp(prefix=f"diary-{day.isoformat()}-", suffix=".md")
+    os.close(handle)
+    path = Path(temporary)
+
+    try:
+        print("diary: write your entry, save, and close the editor.", file=sys.stderr)
+        status = run_editor(path)
+        if status != 0:
+            raise DiaryError(f"The editor exited with status {status}; nothing was added.")
+        text = path.read_text(encoding="utf-8")
+    finally:
+        path.unlink(missing_ok=True)
+
+    if not text.strip():
+        print("Nothing written.")
+        return None
+    return text
+
+
+def open_pdf(pdf: Path) -> None:
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        print(f"PDF  {pretty(pdf)}")
+        return
+
+    opener = shutil.which("xdg-open")
+    if not opener:
+        print(f"PDF  {pretty(pdf)}")
+        return
+
+    try:
+        subprocess.Popen(
+            [opener, str(pdf)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        print(f"PDF  {pretty(pdf)}")
+
+
+# ---------------------------------------------------------------------------
+# Actions
+# ---------------------------------------------------------------------------
+
+def action_add(day: dt.date, text: str, no_open: bool) -> None:
+    month = day.replace(day=1)
+    entry_time = dt.datetime.now().strftime("%H:%M")
+    append_entry(month, day, entry_time, text)
+
+    try:
+        pdf = build(month)
+    except DiaryError as error:
+        raise DiaryError(f"The entry was saved, but the page could not be built.\n\n{error}")
+
+    print(f"Added to {display_date(day)} at {entry_time}.")
+    print(f"PDF  {pretty(pdf)}")
+    if not no_open:
+        open_pdf(pdf)
+
+
+def action_edit(month: dt.date, no_open: bool) -> None:
+    path = ensure_entries_file(month)
+    before = path.stat().st_mtime_ns
+
+    print(f"Editing {pretty(path)}", file=sys.stderr)
+    status = run_editor(path)
+    if status != 0:
+        raise DiaryError(f"The editor exited with status {status}.")
+
+    if path.stat().st_mtime_ns == before:
+        print("No changes.")
+        return
+
+    days = read_days(month)
+    if not days:
+        print("Saved. There are no dated entries yet; add one with `diary`.")
+        if pdf_path(month).exists():
+            print("The existing PDF was left in place.")
+        return
+
+    pdf = build(month)
+    print(f"PDF  {pretty(pdf)}")
+    if not no_open:
+        open_pdf(pdf)
+
+
+def action_build(month: dt.date) -> None:
+    pdf = build(month)
+    print(f"Built {pretty(pdf)}")
+
+
+def action_open(month: dt.date, no_open: bool) -> None:
+    if not entries_path(month).exists() or not read_days(month):
+        raise DiaryError(
+            f"No entries yet in {pretty(month_folder(month))}. "
+            "Write one with `diary`."
+        )
+
+    pdf = pdf_path(month)
+
+    if not pdf.exists() or needs_rebuild(month):
+        pdf = build(month)
+        print(f"Built {pretty(pdf)}")
+
+    if no_open:
+        print(f"PDF  {pretty(pdf)}")
+    else:
+        open_pdf(pdf)
+
+
+def action_list() -> None:
+    if not ROOT.exists():
+        print("No diary months yet.")
+        return
+
+    rows: list[tuple[dt.date, int | None, dt.date | None, bool]] = []
+    for child in ROOT.iterdir():
+        if not child.is_dir():
+            continue
+        match = re.match(r"^(\d{4})-(\d{2})\s+", child.name)
+        if not match:
+            continue
+
+        month = dt.date(int(match.group(1)), int(match.group(2)), 1)
+        try:
+            days = read_days(month)
+            count: int | None = sum(len(entries) for _, entries in days)
+            last = max((day for day, _ in days), default=None)
+        except DiaryError:
+            count = None
+            last = None
+        rows.append((month, count, last, pdf_path(month).exists()))
+
+    if not rows:
+        print("No diary months yet.")
+        return
+
+    now = current_month()
+    print(f" {'MONTH':<19} {'ENTRIES':>7}  {'LAST ENTRY':<13}  PDF")
+    for month, count, last, has_pdf in sorted(rows, key=lambda row: row[0], reverse=True):
+        marker = "*" if month == now else " "
+        count_text = "?" if count is None else str(count)
+        last_text = short_date(last) if last else "-"
+        pdf_text = "yes" if has_pdf else "-"
+        label = f"{month.year:04d}-{month.month:02d} {MONTHS[month.month - 1]}"
+        print(f"{marker}{label:<19} {count_text:>7}  {last_text:<13}  {pdf_text}")
+
+
+# ---------------------------------------------------------------------------
+# Command line
+# ---------------------------------------------------------------------------
+
+def help_text() -> str:
+    now = current_month()
+    return f"""diary - a ruled monthly diary
+
+Usage
+  diary [OPTIONS] [TEXT...]     add an entry; no TEXT opens $EDITOR
+  diary write [OPTIONS]         write in $EDITOR
+  diary edit [--month YYYY-MM]  edit the month's entries.md
+  diary open [--month YYYY-MM]  open the month's PDF
+  diary build [--month YYYY-MM] rebuild the month's PDF
+  diary list                    list all months
+  diary help                    show this help
+
+  Piped text is read from stdin:  echo "A quiet day." | diary
+
+  Each new entry records the local 24-hour time and prints it in the left
+  margin. Older entries without a time still render normally.
+
+Options
+  --date YYYY-MM-DD   add an entry to another day (and its month)
+  --month YYYY-MM     choose a month for edit/open/build
+  --no-open           do not launch the PDF viewer
+  -h, --help          show this help
+
+This month
+  entries  {pretty(entries_path(now))}
+  PDF      {pretty(pdf_path(now))}
+
+Examples
+  diary
+  diary "Rain all afternoon. Read by the window."
+  diary --date 2026-10-20 "A note I forgot to add."
+  diary edit
+  diary open
+"""
+
+
+def parse_options(argv: list[str], base: dict | None = None) -> tuple[dict, list[str]]:
+    options = {
+        "no_open": NO_OPEN_DEFAULT,
+        "date": None,
+        "month": None,
+        "help": False,
+        "literal": False,
+    }
+    if base:
+        for key, value in base.items():
+            if value is not None and value is not False:
+                options[key] = value
+
+    index = 0
+    while index < len(argv):
+        argument = argv[index]
+
+        if argument == "--":
+            options["literal"] = True
+            index += 1
+            break
+        if argument in ("-h", "--help"):
+            options["help"] = True
+            index += 1
+        elif argument == "--no-open":
+            options["no_open"] = True
+            index += 1
+        elif argument == "--date" or argument.startswith("--date="):
+            if argument == "--date":
+                if index + 1 >= len(argv):
+                    raise DiaryError("--date needs a value, for example 2026-10-22.")
+                options["date"] = argv[index + 1]
+                index += 2
+            else:
+                options["date"] = argument.split("=", 1)[1]
+                index += 1
+        elif argument == "--month" or argument.startswith("--month="):
+            if argument == "--month":
+                if index + 1 >= len(argv):
+                    raise DiaryError("--month needs a value, for example 2026-10.")
+                options["month"] = argv[index + 1]
+                index += 2
+            else:
+                options["month"] = argument.split("=", 1)[1]
+                index += 1
+        elif argument.startswith("-") and argument != "-":
+            raise DiaryError(f"Unknown option {argument!r}. Try `diary --help`.")
+        else:
+            break
+
+    return options, argv[index:]
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+
+    options, rest = parse_options(argv)
+
+    subcommand = None
+    if rest and rest[0] in SUBCOMMANDS and not options["literal"]:
+        subcommand = rest[0]
+        options, rest = parse_options(rest[1:], options)
+
+    if options["help"] or subcommand == "help":
+        print(help_text())
+        return 0
+
+    if subcommand in (None, "write", "add"):
+        if options["month"]:
+            raise DiaryError("--month is for edit, open, and build. Use --date for entries.")
+
+        day = parse_day(options["date"]) if options["date"] else dt.date.today()
+
+        if rest:
+            text = " ".join(rest)
+        elif subcommand != "write" and not sys.stdin.isatty():
+            text = sys.stdin.read()
+            if not text.strip():
+                raise DiaryError("No entry text was provided on stdin.")
+        else:
+            text = compose_entry(day)
+            if text is None:
+                return 0
+
+        action_add(day, text, options["no_open"])
+        return 0
+
+    if options["date"]:
+        raise DiaryError("--date is for entries. Use --month to choose a month here.")
+
+    if subcommand == "edit":
+        if rest:
+            raise DiaryError(f"Unexpected argument: {' '.join(rest)!r}")
+        month = parse_month(options["month"]) if options["month"] else current_month()
+        action_edit(month, options["no_open"])
+        return 0
+
+    if subcommand == "open":
+        if rest:
+            raise DiaryError(f"Unexpected argument: {' '.join(rest)!r}")
+        month = parse_month(options["month"]) if options["month"] else current_month()
+        action_open(month, options["no_open"])
+        return 0
+
+    if subcommand == "build":
+        if rest:
+            raise DiaryError(f"Unexpected argument: {' '.join(rest)!r}")
+        month = parse_month(options["month"]) if options["month"] else current_month()
+        action_build(month)
+        return 0
+
+    if subcommand in ("list", "months"):
+        if rest:
+            raise DiaryError(f"Unexpected argument: {' '.join(rest)!r}")
+        action_list()
+        return 0
+
+    raise DiaryError(f"Unknown command: {subcommand!r}")
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except DiaryError as error:
+        print(f"diary: {error}", file=sys.stderr)
+        raise SystemExit(1)
+    except KeyboardInterrupt:
+        print("diary: interrupted", file=sys.stderr)
+        raise SystemExit(130)
